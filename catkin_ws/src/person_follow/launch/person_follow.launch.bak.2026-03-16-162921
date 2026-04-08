@@ -1,0 +1,9 @@
+<launch>
+  <env name="PYTHONPATH" value="/home/h/DeepSort/YOLOv8-DeepSORT-Object-Tracking-main"/>
+  <env name="LD_PRELOAD" value="/usr/lib/aarch64-linux-gnu/libgomp.so.1"/>
+  <node pkg="person_follow" type="follow_controller_node.py" name="follow_controller_node" output="screen" launch-prefix="/usr/bin/python2">
+    <param name="image_width" value="1280"/>
+    <param name="target_timeout" value="0.5"/>
+  </node>
+
+</launch>

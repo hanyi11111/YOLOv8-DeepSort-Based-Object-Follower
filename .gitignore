@@ -1,0 +1,53 @@
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+*.swp
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# ===== Logs / caches =====
+*.log
+logs/
+log/
+
+# ===== ROS / catkin / colcon common outputs =====
+**/build/
+**/devel/
+**/install/
+**/log/
+**/.catkin_tools/
+**/.ros/
+
+# ===== Data / models (usually too large for GitHub) =====
+*.bag
+*.db3
+
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+datasets/
+data/
+runs/
+weights/
+
+
+# ===== ultralytics / deepsort large artifact =====
+DeepSort/YOLOv8-DeepSORT-Object-Tracking-main/ultralytics/yolo/v8/detect/core
+DeepSort/**/__pycache__/

@@ -1,0 +1,9 @@
+<launch>
+  <env name="PYTHONPATH" value="/home/h/DeepSort/YOLOv8-DeepSORT-Object-Tracking-main"/>
+  <env name="LD_PRELOAD" value="/usr/lib/aarch64-linux-gnu/libgomp.so.1"/>
+
+  <node pkg="person_follow"
+        type="person_follow_node.py"
+        name="person_follow_node"
+        output="screen"/>
+</launch>

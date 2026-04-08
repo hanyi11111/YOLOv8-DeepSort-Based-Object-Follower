@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import base64
+import contextlib
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+import threading
+
+import cv2
+import numpy as np
+import roslibpy
+from ultralytics import YOLO
+# 内嵌 ultralytics 8.0.3：Hydra 对 cls/classes 校验与 merge 不一致，会误 exit()
+try:
+    import ultralytics.yolo.configs.hydra_patch as _hydra_patch
+    _hydra_patch.check_config_mismatch = lambda *a, **kw: None
+except Exception:
+    pass
+
+# get_config 合并后要求有 classes；内嵌 8.0.3 只传 cls 会 OmegaConf Missing key classes
+try:
+    import ultralytics.yolo.configs as _ycfg
+    _orig_get_config = _ycfg.get_config
+    def _get_config_classes_from_cls(config, overrides):
+        o = overrides
+        try:
+            from omegaconf import OmegaConf
+            if hasattr(overrides, "keys") and not isinstance(overrides, dict):
+                o = OmegaConf.to_container(overrides, resolve=True)
+        except Exception:
+            pass
+        if not isinstance(o, dict):
+            o = dict(overrides) if overrides else {}
+        else:
+            o = dict(o)
+        if o.get("cls") is not None and o.get("classes") is None:
+            o["classes"] = o["cls"]
+        return _orig_get_config(config, o)
+    _ycfg.get_config = _get_config_classes_from_cls
+except Exception as _e:
+    print("get_config patch failed:", _e)
+
+
+@contextlib.contextmanager
+def _silence_ultralytics_predict_spam():
+    """内嵌 YOLOv8.0.3 在每次 predict() 时仍会向 stdout/stderr 刷 Fusing layers / summary；推理阶段临时静默。"""
+    with open(os.devnull, "w") as devnull:
+        old_out, old_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout = sys.stderr = devnull
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+
+try:
+    logging.getLogger("ultralytics").setLevel(logging.ERROR)
+except Exception:
+    pass
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--ros-host', default='127.0.0.1')
+    p.add_argument('--ros-port', type=int, default=9090)
+    p.add_argument('--image-topic', default='/camera/color/image_raw/compressed')
+    p.add_argument('--target-topic', default='/person_follow/target')
+    p.add_argument('--weights', default='yolov8n.pt')
+    p.add_argument('--conf', type=float, default=0.35)
+    p.add_argument('--device', default='0')  # '0' or 'cpu'
+    p.add_argument(
+        '--deepsort',
+        action='store_true',
+        help='use DeepSORT; only publish when a track is confirmed (n_init frames)',
+    )
+    p.add_argument(
+        '--print-detections',
+        action='store_true',
+        help='print whether YOLO sees person(s) in stream (throttled; for debugging)',
+    )
+    p.add_argument(
+        '--print-interval',
+        type=float,
+        default=1.0,
+        metavar='SEC',
+        help='min seconds between --print-detections lines (default: 1.0)',
+    )
+    return p.parse_args()
+
+
+class DetectorBridge(object):
+    def __init__(self, args):
+        self.args = args
+        self.ros = roslibpy.Ros(host=args.ros_host, port=args.ros_port)
+        self.pub = None
+        self.sub = None
+
+        self.model = YOLO(args.weights)
+        self.tracker = None
+        if args.deepsort:
+            from deep_sort_realtime.deepsort_tracker import DeepSort
+            self.tracker = DeepSort(
+                max_age=30,
+                n_init=2,
+                nms_max_overlap=1.0,
+                embedder='mobilenet',
+                half=True,
+                bgr=True,
+                embedder_gpu=True,
+            )
+
+        self._busy = False
+        self._lock = threading.Lock()
+        self._last_log = 0.0
+        self._last_det_print = 0.0
+
+    def _log(self, msg):
+        now = time.time()
+        if now - self._last_log > 1.0:
+            print(msg, flush=True)
+            self._last_log = now
+
+    def on_image(self, msg):
+        with self._lock:
+            if self._busy:
+                return
+            self._busy = True
+
+        try:
+            data_b64 = msg.get('data', '')
+            if not data_b64:
+                return
+            jpg = base64.b64decode(data_b64)
+            frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                return
+
+            # YOLOv8.0.3：predict(source=ndarray) 会误当路径；先写临时 jpg
+            fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+            os.close(fd)
+            try:
+                cv2.imwrite(tmp_path, frame)
+                with _silence_ultralytics_predict_spam():
+                    results = self.model.predict(
+                        source=tmp_path,
+                        conf=self.args.conf,
+                        classes=[0],
+                        verbose=False,
+                        device=self.args.device,
+                    )
+                # 某些情况下 predict 返回空列表，[0] 会 IndexError
+                if isinstance(results, (list, tuple)):
+                    if len(results) == 0:
+                        return
+                    result = results[0]
+                else:
+                    result = results
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+            detections = []
+            if result.boxes is not None and len(result.boxes) > 0:
+                xyxy = result.boxes.xyxy.cpu().numpy()
+                confs = result.boxes.conf.cpu().numpy()
+                clss = result.boxes.cls.cpu().numpy()
+
+                for box, conf, cls_id in zip(xyxy, confs, clss):
+                    if int(cls_id) != 0:
+                        continue
+                    x1, y1, x2, y2 = box.tolist()
+                    w = max(0.0, x2 - x1)
+                    h = max(0.0, y2 - y1)
+                    if w < 2 or h < 2:
+                        continue
+                    detections.append(([x1, y1, w, h], float(conf), 'person'))
+
+            if self.args.print_detections:
+                now = time.time()
+                if now - self._last_det_print >= self.args.print_interval:
+                    self._last_det_print = now
+                    n_raw = (
+                        len(result.boxes)
+                        if result.boxes is not None
+                        else 0
+                    )
+                    if len(detections) == 0:
+                        extra = ""
+                        if n_raw > 0:
+                            rclss = result.boxes.cls.cpu().numpy()
+                            rconf = result.boxes.conf.cpu().numpy()
+                            extra = " raw_boxes={} cls={} conf={}".format(
+                                n_raw,
+                                [int(x) for x in rclss.tolist()],
+                                ["{:.2f}".format(float(c)) for c in rconf.tolist()],
+                            )
+                        print(
+                            "[det] no COCO-person (class0, conf>={}){}. "
+                            "Inference runs every frame; no /person_follow/target until a person is found.".format(
+                                self.args.conf,
+                                extra,
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        mx = max(d[1] for d in detections)
+                        print(
+                            "[det] person x{}  max_conf={:.2f} (raw_boxes={})".format(
+                                len(detections), mx, n_raw
+                            ),
+                            flush=True,
+                        )
+
+            best = None
+            if self.tracker is not None:
+                tracks = self.tracker.update_tracks(detections, frame=frame)
+                # 选一个主目标：高度最大的已确认 track
+                best_h = -1.0
+                for t in tracks:
+                    if not t.is_confirmed():
+                        continue
+                    l, ttop, r, b = t.to_ltrb()
+                    w = max(0.0, r - l)
+                    h = max(0.0, b - ttop)
+                    if h > best_h:
+                        best_h = h
+                        best = (int(t.track_id), l, ttop, w, h, 1.0)
+            else:
+                # 仅 YOLO：高度最大的人框，每帧有检测就发（不经过 DeepSORT）
+                best_h = -1.0
+                for (x1, y1, w, h), conf, _ in detections:
+                    h = float(h)
+                    if h > best_h:
+                        best_h = h
+                        best = (0, float(x1), float(y1), float(w), float(h), float(conf))
+
+            if best is not None:
+                tid, l, ttop, w, h, det_conf = best
+                payload = {
+                    "id": tid,
+                    "cx": l + w * 0.5,
+                    "cy": ttop + h * 0.5,
+                    "w": w,
+                    "h": h,
+                    "conf": det_conf,
+                    "stamp": time.time(),
+                }
+                self.pub.publish(roslibpy.Message({'data': json.dumps(payload)}))
+                self._log(
+                    "publish target id={} cx={:.1f} h={:.1f} conf={:.2f}".format(
+                        tid, payload["cx"], payload["h"], det_conf
+                    )
+                )
+        except Exception as e:
+            print("on_image error:", e, flush=True)
+        finally:
+            with self._lock:
+                self._busy = False
+
+    def run(self):
+        print("Connecting rosbridge ws://{}:{} ...".format(self.args.ros_host, self.args.ros_port), flush=True)
+        self.ros.run()
+        if not self.ros.is_connected:
+            raise RuntimeError("rosbridge connect failed")
+
+        self.pub = roslibpy.Topic(self.ros, self.args.target_topic, 'std_msgs/String')
+        self.sub = roslibpy.Topic(self.ros, self.args.image_topic, 'sensor_msgs/CompressedImage')
+        self.sub.subscribe(self.on_image)
+
+        print("Subscribed: {}".format(self.args.image_topic), flush=True)
+        print("Publishing: {}".format(self.args.target_topic), flush=True)
+        if self.args.print_detections:
+            print(
+                "--print-detections: every ~{}s print YOLO person count for camera stream".format(
+                    self.args.print_interval
+                ),
+                flush=True,
+            )
+
+        try:
+            while self.ros.is_connected:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                if self.sub:
+                    self.sub.unsubscribe()
+                if self.pub:
+                    self.pub.unadvertise()
+            finally:
+                self.ros.terminate()
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    DetectorBridge(args).run()

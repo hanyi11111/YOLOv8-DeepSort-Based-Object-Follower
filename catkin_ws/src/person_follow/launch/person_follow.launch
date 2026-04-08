@@ -1,0 +1,65 @@
+<launch>
+  <arg name="start_base" default="true"/>
+  <arg name="start_camera" default="false"/>
+  <arg name="start_rosbridge" default="true"/>
+  <arg name="start_detector" default="true"/>
+
+  <arg name="is_bunker_mini" default="true"/>
+  <arg name="ros_host" default="127.0.0.1"/>
+  <arg name="rosbridge_port" default="9090"/>
+
+  <arg name="image_topic" default="/camera/color/image_raw/compressed"/>
+  <arg name="target_topic" default="/person_follow/target"/>
+  <arg name="detector_python" default="$(env HOME)/venv/yolo38/bin/python"/>
+  <arg name="detector_script" default="$(env HOME)/person_detect_rosbridge_yolo38.py"/>
+  <arg name="weights" default="yolov8n.pt"/>
+  <arg name="conf" default="0.30"/>
+  <arg name="imgsz" default="640"/>
+  <arg name="device" default="cpu"/>
+
+  <arg name="image_width" default="640"/>
+  <arg name="target_timeout" default="0.5"/>
+  <arg name="max_lin" default="0.12"/>
+  <arg name="max_ang" default="0.20"/>
+  <arg name="kp_lin" default="0.30"/>
+  <arg name="kp_ang" default="0.25"/>
+  <arg name="desired_h" default="380"/>
+
+  <include if="$(arg start_base)" file="$(find bunker_bringup)/launch/bunker_robot_base.launch">
+    <arg name="is_bunker_mini" value="$(arg is_bunker_mini)"/>
+  </include>
+
+  <include if="$(arg start_camera)" file="$(find realsense2_camera)/launch/rs_camera.launch"/>
+
+  <node pkg="person_follow"
+        type="follow_controller_node.py"
+        name="follow_controller_node"
+        output="screen"
+        launch-prefix="/usr/bin/python2">
+    <param name="image_width" value="$(arg image_width)"/>
+    <param name="target_timeout" value="$(arg target_timeout)"/>
+    <param name="max_lin" value="$(arg max_lin)"/>
+    <param name="max_ang" value="$(arg max_ang)"/>
+    <param name="kp_lin" value="$(arg kp_lin)"/>
+    <param name="kp_ang" value="$(arg kp_ang)"/>
+    <param name="desired_h" value="$(arg desired_h)"/>
+    <env name="ROS_PYTHON_VERSION" value="2"/>
+  </node>
+
+  <node pkg="topic_tools"
+        type="relay"
+        name="cmd_vel_to_smoother"
+        args="/cmd_vel /smoother_cmd_vel"
+        output="screen"/>
+
+  <include if="$(arg start_rosbridge)" file="$(find rosbridge_server)/launch/rosbridge_websocket.launch">
+    <arg name="port" value="$(arg rosbridge_port)"/>
+  </include>
+
+  <node if="$(arg start_detector)"
+        pkg="person_follow"
+        type="person_detect_rosbridge_yolo38.launcher.sh"
+        name="person_detector"
+        output="screen"
+        args="--python $(arg detector_python) --script $(arg detector_script) --ros-host $(arg ros_host) --ros-port $(arg rosbridge_port) --image-topic $(arg image_topic) --target-topic $(arg target_topic) --weights $(arg weights) --conf $(arg conf) --imgsz $(arg imgsz) --device $(arg device)"/>
+</launch>
